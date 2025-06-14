@@ -24,35 +24,44 @@
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
+import logging  # Import the logging module
 
 # Initialize Qt resources from file resources.py
 from .resources import *
+
 # Import the code for the dialog
-from .pipeline_monitor_dialog import PipelineMonitorDialog
+from .pipeline_monitor_dialog import (
+    PipelineMonitorDialog,
+    QgsMessageLogHandler,
+)  # Import QgsMessageLogHandler here
 import os.path
+
+# # Get a logger for the main plugin class # REMOVED: Module-level logger is moved to instance level
+# PLUGIN_LOGGER = logging.getLogger("PipelineMonitorPlugin")
+# PLUGIN_LOGGER.setLevel(logging.DEBUG)
+# # Configure logging to QGIS message bar if not already set up
+# if not any(isinstance(h, QgsMessageLogHandler) for h in PLUGIN_LOGGER.handlers):
+#     qgis_handler = QgsMessageLogHandler()
+#     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+#     qgis_handler.setFormatter(formatter)
+#     PLUGIN_LOGGER.addHandler(qgis_handler)
+#     PLUGIN_LOGGER.propagate = False # Prevent messages from going to root logger
 
 
 class PipelineMonitor:
     """QGIS Plugin Implementation."""
 
     def __init__(self, iface):
-        """Constructor.
-
-        :param iface: An interface instance that will be passed to this class
-            which provides the hook by which you can manipulate the QGIS
-            application at run time.
-        :type iface: QgsInterface
-        """
+        # PLUGIN_LOGGER.debug("PipelineMonitor plugin __init__ called.") # Replaced with instance logger
         # Save reference to the QGIS interface
         self.iface = iface
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
         # initialize locale
-        locale = QSettings().value('locale/userLocale')[0:2]
+        locale = QSettings().value("locale/userLocale")[0:2]
         locale_path = os.path.join(
-            self.plugin_dir,
-            'i18n',
-            'PipelineMonitor_{}.qm'.format(locale))
+            self.plugin_dir, "i18n", "PipelineMonitor_{}.qm".format(locale)
+        )
 
         if os.path.exists(locale_path):
             self.translator = QTranslator()
@@ -61,11 +70,9 @@ class PipelineMonitor:
 
         # Declare instance attributes
         self.actions = []
-        self.menu = self.tr(u'&管线监控工具')
-
-        # Check if plugin was started the first time in current QGIS session
-        # Must be set in initGui() to survive plugin reloads
-        self.first_start = None
+        self.menu = self.tr("&管线监控工具")
+        self.dlg = None  # Initialize dialog instance to None
+        self.plugin_logger = None  # Initialize instance logger
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -80,8 +87,7 @@ class PipelineMonitor:
         :rtype: QString
         """
         # noinspection PyTypeChecker,PyArgumentList,PyCallByClass
-        return QCoreApplication.translate('PipelineMonitor', message)
-
+        return QCoreApplication.translate("PipelineMonitor", message)
 
     def add_action(
         self,
@@ -93,7 +99,8 @@ class PipelineMonitor:
         add_to_toolbar=True,
         status_tip=None,
         whats_this=None,
-        parent=None):
+        parent=None,
+    ):
         """Add a toolbar icon to the toolbar.
 
         :param icon_path: Path to the icon for this action. Can be a resource
@@ -149,9 +156,7 @@ class PipelineMonitor:
             self.iface.addToolBarIcon(action)
 
         if add_to_menu:
-            self.iface.addPluginToMenu(
-                self.menu,
-                action)
+            self.iface.addPluginToMenu(self.menu, action)
 
         self.actions.append(action)
 
@@ -159,42 +164,65 @@ class PipelineMonitor:
 
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
+        # Setup instance logger here to ensure it's always correctly configured on plugin load/reload
+        if self.plugin_logger is None:
+            self.plugin_logger = logging.getLogger("PipelineMonitorPlugin")
+            self.plugin_logger.setLevel(logging.DEBUG)
+            # Add QgsMessageLogHandler if not already present
+            if not any(
+                isinstance(h, QgsMessageLogHandler) for h in self.plugin_logger.handlers
+            ):
+                qgis_handler = QgsMessageLogHandler()
+                formatter = logging.Formatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                )
+                qgis_handler.setFormatter(formatter)
+                self.plugin_logger.addHandler(qgis_handler)
+                self.plugin_logger.propagate = False
 
-        icon_path = ':/plugins/pipeline_monitor/icon.png'
+        self.plugin_logger.debug("PipelineMonitor plugin initGui called.")
+
+        icon_path = ":/plugins/pipeline_monitor/icon.png"
         self.add_action(
             icon_path,
-            text=self.tr(u''),
+            text=self.tr(""),
             callback=self.run,
-            parent=self.iface.mainWindow())
-
-        # will be set False in run()
-        self.first_start = True
-
+            parent=self.iface.mainWindow(),
+        )
 
     def unload(self):
+        if self.plugin_logger:
+            self.plugin_logger.debug("PipelineMonitor plugin unload called.")
         """Removes the plugin menu item and icon from QGIS GUI."""
         for action in self.actions:
-            self.iface.removePluginMenu(
-                self.tr(u'&管线监控工具'),
-                action)
+            self.iface.removePluginMenu(self.tr("&管线监控工具"), action)
             self.iface.removeToolBarIcon(action)
 
-
     def run(self):
-        """Run method that performs all the real work"""
+        if self.plugin_logger:
+            self.plugin_logger.debug("PipelineMonitor plugin run called.")
+        """当点击工具栏按钮或菜单项时运行"""
+        # Ensure the dialog is created only once and re-used
+        if not hasattr(self, "dlg") or self.dlg is None or not self.dlg.isVisible():
+            if self.plugin_logger:
+                self.plugin_logger.debug(
+                    "Dialog instance not found, is None, or not visible. Creating new dialog."
+                )
+            # 创建对话框实例，并将主窗口作为父级
+            self.dlg = PipelineMonitorDialog(self.iface.mainWindow())
+            # 将QGIS的iface接口传递给对话框，以便对话框能访问地图画布等
+            self.dlg.set_iface(self.iface)
+            # 实现首次打开时自动加载数据
+            self.dlg.load_and_display_data()
+        else:
+            if self.plugin_logger:
+                self.plugin_logger.debug(
+                    "Dialog instance already exists and is visible. Bringing to front."
+                )
+            # If dialog already exists and is visible, bring it to front
+            self.dlg.show()
+            self.dlg.raise_()
+            self.dlg.activateWindow()
 
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
-        if self.first_start == True:
-            self.first_start = False
-            self.dlg = PipelineMonitorDialog()
-
-        # show the dialog
+        # 显示对话框 (ensure it's visible even if it was just created or was hidden)
         self.dlg.show()
-        # Run the dialog event loop
-        result = self.dlg.exec_()
-        # See if OK was pressed
-        if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
