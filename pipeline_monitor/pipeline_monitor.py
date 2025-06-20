@@ -25,6 +25,7 @@ from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 import logging  # Import the logging module
+import traceback
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -33,7 +34,7 @@ from .resources import *
 from .pipeline_monitor_dialog import (
     PipelineMonitorDialog,
     QgsMessageLogHandler,
-)  # Import QgsMessageLogHandler here
+)
 import os.path
 
 # # Get a logger for the main plugin class # REMOVED: Module-level logger is moved to instance level
@@ -185,7 +186,7 @@ class PipelineMonitor:
         icon_path = ":/plugins/pipeline_monitor/icon.png"
         self.add_action(
             icon_path,
-            text=self.tr(""),
+            text=self.tr("管线监控"),
             callback=self.run,
             parent=self.iface.mainWindow(),
         )
@@ -214,6 +215,25 @@ class PipelineMonitor:
             self.dlg.set_iface(self.iface)
             # 实现首次打开时自动加载数据
             self.dlg.load_and_display_data()
+
+            # 在加载数据完成后再初始化底图
+            try:
+                if hasattr(self.dlg, "baseMapComboBox"):
+                    current_index = self.dlg.baseMapComboBox.currentIndex()
+                    if self.plugin_logger:
+                        self.plugin_logger.debug(
+                            f"准备切换底图，选择索引: {current_index}"
+                        )
+                    # 确保底图图层已正确初始化
+                    if not self.dlg.base_map_layers:
+                        self.plugin_logger.debug(
+                            "底图尚未初始化，调用 initialize_base_maps"
+                        )
+                        self.dlg.initialize_base_maps()
+                    self.dlg.switch_base_map(current_index)
+            except Exception as e:
+                if self.plugin_logger:
+                    self.plugin_logger.error(f"初始化底图时出现错误: {str(e)}")
         else:
             if self.plugin_logger:
                 self.plugin_logger.debug(

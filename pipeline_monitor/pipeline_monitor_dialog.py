@@ -7,6 +7,8 @@ import sys  # Import sys for robust logging
 from qgis.PyQt import uic
 from qgis.PyQt.QtWidgets import QDialog, QListWidgetItem, QLabel
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtCore import Qt, QMetaType
+from PyQt5.QtCore import QVariant, QSettings  # 添加QSettings导入
 from qgis.core import (
     QgsProject,
     QgsVectorLayer,
@@ -29,8 +31,8 @@ from qgis.core import (
     QgsLayerTreeLayer,
     QgsMessageLog,
     Qgis,  # Import Qgis for message levels
+    QgsSingleSymbolRenderer,  # 用于行政规划图样式设置
 )
-from qgis.PyQt.QtCore import QVariant
 
 from .map_tool import PointTool
 from .pile_details_dialog import PileDetailsDialog
@@ -75,6 +77,8 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
         self.pipeline_layer = None
         self.iface = None
         self.point_tool = None
+        self.first_open = True  # 标记是否是首次打开插件
+        self.data_loaded = False  # 标记数据是否已加载
 
         # Initialize logger
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -106,14 +110,31 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
         )
 
         if hasattr(self, "loadDataButton"):
-            self.loadDataButton.clicked.connect(self.load_and_display_data)
+            self.loadDataButton.clicked.connect(lambda: self.load_and_display_data())
 
         if hasattr(self, "identifyButton"):
             self.identifyButton.setCheckable(True)
             self.identifyButton.clicked.connect(self.activate_point_tool)
 
+        # 连接底图下拉框的信号
+        if hasattr(self, "baseMapComboBox"):
+            self.baseMapComboBox.currentIndexChanged.connect(self.switch_base_map)
+
+        # 初始化底图相关变量 (放在最后初始化，避免在对象创建过程中被访问导致问题)
+        self.base_map_layers = {}
+        self.current_base_map = None
+
     def set_iface(self, iface):
         self.iface = iface
+
+        # 设置地图画布的坐标参考系统为Web Mercator (EPSG:3857)
+        if self.iface and self.iface.mapCanvas():
+            crs = QgsCoordinateReferenceSystem("EPSG:3857")
+            self.iface.mapCanvas().setDestinationCrs(crs)
+            self.logger.debug("已将地图画布坐标系设置为EPSG:3857 (Web Mercator)")
+
+        # 设置界面接口后初始化底图
+        self.initialize_base_maps()
 
     def calculate_risk_level(self, voltage):
         """根据电压值计算风险等级字符串"""
@@ -125,6 +146,256 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
             return "正常"
         else:
             return "欠保护"
+
+    def initialize_base_maps(self):
+        """初始化所有底图图层 - 一次性创建所有底图并添加到图层树，通过控制可见性来切换"""
+        if not self.iface:
+            self.logger.error("无法初始化底图：iface未设置")
+            return
+
+        self.logger.debug("开始初始化底图...")
+
+        # 检查是否已经初始化过底图
+        if self.base_map_layers and not self.first_open:
+            self.logger.debug("底图已经初始化且非首次打开，保留当前视图")
+            return
+
+        # 清空现有底图字典
+        self.base_map_layers = {}
+
+        # 获取图层树根节点
+        root = QgsProject.instance().layerTreeRoot()
+
+        # 设置HTTP请求的用户代理
+        settings = QSettings()
+        settings.setValue(
+            "qgis/networkAndProxy/userAgent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        )
+        self.logger.debug("已设置HTTP请求的用户代理")
+
+        try:
+            # 1. 行政规划图（GeoJSON）
+            existing_admin = self.find_existing_layer("行政规划图")
+            if existing_admin:
+                self.logger.debug("行政规划图已存在，使用现有图层")
+                admin_layer = existing_admin
+            else:
+                admin_map_uri = (
+                    "https://geo.datav.aliyun.com/areas_v3/bound/100000_full_city.json"
+                )
+                self.logger.debug(f"尝试加载行政规划图: {admin_map_uri}")
+                admin_layer = QgsVectorLayer(admin_map_uri, "行政规划图", "ogr")
+
+                if admin_layer.isValid():
+                    # 应用样式
+                    style_config = {
+                        "fill_color": "#ffffff",  # 白色填充
+                        "outline_color": "#000000",  # 黑色边框
+                        "outline_style": "dash",  # 虚线边框
+                        "outline_width": "0.1",  # 边框宽度
+                    }
+
+                    # 创建符号并设置样式
+                    symbol = QgsSymbol.defaultSymbol(admin_layer.geometryType())
+                    symbol.setColor(QColor(style_config["fill_color"]))
+
+                    # 获取符号图层并设置边框属性
+                    if hasattr(symbol, "symbolLayer") and symbol.symbolLayerCount() > 0:
+                        symbol_layer = symbol.symbolLayer(0)
+                        symbol_layer.setStrokeColor(
+                            QColor(style_config["outline_color"])
+                        )
+                        symbol_layer.setStrokeWidth(
+                            float(style_config["outline_width"])
+                        )
+                        symbol_layer.setStrokeStyle(Qt.DashLine)
+
+                    # 应用符号到图层
+                    renderer = QgsSingleSymbolRenderer(symbol)
+                    admin_layer.setRenderer(renderer)
+
+                    # 添加到项目但不在图层树显示
+                    QgsProject.instance().addMapLayer(admin_layer, False)
+
+                    # 添加到图层树的底部
+                    child_count = len(root.children())
+                    admin_node = QgsLayerTreeLayer(admin_layer)
+                    root.insertChildNode(child_count, admin_node)
+                    self.logger.debug("行政规划图已加载并添加到图层树底部")
+                else:
+                    self.logger.warning(f"行政规划图加载失败: {admin_map_uri}")
+                    admin_layer = None
+
+            if admin_layer:
+                self.base_map_layers["admin"] = admin_layer
+                # 默认隐藏图层
+                root.findLayer(admin_layer.id()).setItemVisibilityChecked(False)
+
+            # 2. 高德地形图（XYZ瓦片）
+            existing_terrain = self.find_existing_layer("高德地形图")
+            if existing_terrain:
+                self.logger.debug("高德地形图已存在，使用现有图层")
+                terrain_layer = existing_terrain
+            else:
+                # 使用更新后的URL格式
+                terrain_url = "type=xyz&url=http-header:referer=&type=xyz&url=https://webst01.is.autonavi.com/appmaptile?style%3D6%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=19&zmin=0"
+                self.logger.debug(f"尝试加载高德地形图: {terrain_url}")
+
+                try:
+                    terrain_layer = QgsRasterLayer(terrain_url, "高德地形图", "wms")
+                    if terrain_layer.isValid():
+                        self.logger.debug("高德地形图加载成功")
+                        # 添加到项目但不在图层树显示
+                        QgsProject.instance().addMapLayer(terrain_layer, False)
+
+                        # 添加到图层树的底部
+                        child_count = len(root.children())
+                        terrain_node = QgsLayerTreeLayer(terrain_layer)
+                        root.insertChildNode(child_count, terrain_node)
+                        self.logger.debug("高德地形图已加载并添加到图层树底部")
+                    else:
+                        self.logger.warning("高德地形图加载失败")
+                        terrain_layer = None
+                except Exception as e:
+                    self.logger.error(f"加载高德地形图时出错: {str(e)}")
+                    terrain_layer = None
+
+            if terrain_layer:
+                self.base_map_layers["terrain"] = terrain_layer
+                # 默认隐藏图层
+                root.findLayer(terrain_layer.id()).setItemVisibilityChecked(False)
+
+            # 3. 高德矢量图（XYZ瓦片）
+            existing_vector = self.find_existing_layer("高德矢量图")
+            if existing_vector:
+                self.logger.debug("高德矢量图已存在，使用现有图层")
+                vector_layer = existing_vector
+            else:
+                # 使用更新后的URL格式
+                vector_url = "type=xyz&url=http-header:referer=&type=xyz&url=https://webrd02.is.autonavi.com/appmaptile?lang%3Dzh_cn%26size%3D1%26scale%3D1%26style%3D8%26x%3D%7Bx%7D%26y%3D%7By%7D%26z%3D%7Bz%7D&zmax=18&zmin=0"
+                self.logger.debug(f"尝试加载高德矢量图: {vector_url}")
+
+                try:
+                    vector_layer = QgsRasterLayer(vector_url, "高德矢量图", "wms")
+                    if vector_layer.isValid():
+                        self.logger.debug("高德矢量图加载成功")
+                        # 添加到项目但不在图层树显示
+                        QgsProject.instance().addMapLayer(vector_layer, False)
+
+                        # 添加到图层树的底部
+                        child_count = len(root.children())
+                        vector_node = QgsLayerTreeLayer(vector_layer)
+                        root.insertChildNode(child_count, vector_node)
+                        self.logger.debug("高德矢量图已加载并添加到图层树底部")
+                    else:
+                        self.logger.warning("高德矢量图加载失败")
+                        vector_layer = None
+                except Exception as e:
+                    self.logger.error(f"加载高德矢量图时出错: {str(e)}")
+                    vector_layer = None
+
+            if vector_layer:
+                self.base_map_layers["vector"] = vector_layer
+                # 默认隐藏图层
+                root.findLayer(vector_layer.id()).setItemVisibilityChecked(False)
+
+            # 记录已加载的底图数量
+            loaded_maps = sum(
+                1
+                for layer in self.base_map_layers.values()
+                if layer and layer.isValid()
+            )
+            self.logger.info(
+                f"底图初始化完成，成功加载 {loaded_maps}/{len(self.base_map_layers)} 个底图"
+            )
+
+            # 如果是首次打开，尝试读取上次使用的底图索引
+            if self.first_open and hasattr(self, "baseMapComboBox"):
+                settings = QSettings()
+                last_index = settings.value(
+                    "PipelineMonitor/lastBaseMapIndex", 0, type=int
+                )
+
+                # 确保索引在有效范围内
+                if last_index >= 0 and last_index < self.baseMapComboBox.count():
+                    self.baseMapComboBox.setCurrentIndex(last_index)
+                    self.switch_base_map(last_index)
+                else:
+                    # 如果索引无效，使用默认值0
+                    self.baseMapComboBox.setCurrentIndex(0)
+                    self.switch_base_map(0)
+
+                self.first_open = False  # 标记为非首次打开
+
+        except Exception as e:
+            self.logger.error(f"初始化底图时发生错误: {str(e)}")
+            self.logger.error(traceback.format_exc())
+
+    def switch_base_map(self, index):
+        """根据下拉框选择切换底图 - 通过控制可见性"""
+        if not self.iface:
+            return
+
+        self.logger.debug(f"切换底图，选择索引: {index}")
+
+        # 检查底图是否已经初始化
+        if not self.base_map_layers:
+            self.logger.warning("底图尚未初始化，先执行initialize_base_maps")
+            self.initialize_base_maps()
+            return  # 初始化后会自动调用switch_base_map，这里直接返回
+
+        # 获取图层树根节点
+        root = QgsProject.instance().layerTreeRoot()
+
+        # 先隐藏所有底图
+        for layer in self.base_map_layers.values():
+            if layer and layer.isValid():
+                layer_node = root.findLayer(layer.id())
+                if layer_node:
+                    layer_node.setItemVisibilityChecked(False)
+
+        # 根据索引获取对应底图类型
+        map_type = None
+        if index == 0:
+            map_type = "admin"
+        elif index == 1:
+            map_type = "terrain"
+        elif index == 2:
+            map_type = "vector"
+        else:
+            self.logger.warning(f"未知底图索引: {index}")
+            return
+
+        # 显示选中的底图
+        selected_layer = self.base_map_layers.get(map_type)
+        if selected_layer and selected_layer.isValid():
+            try:
+                # 更新当前底图引用
+                self.current_base_map = selected_layer
+
+                # 设置为可见
+                layer_node = root.findLayer(selected_layer.id())
+                if layer_node:
+                    layer_node.setItemVisibilityChecked(True)
+                    self.logger.debug(f"显示底图: {selected_layer.name()}")
+                    self.update_status_label(f"已切换底图: {selected_layer.name()}")
+
+                    # 保存当前底图索引到QSettings，以便下次打开时恢复
+                    settings = QSettings()
+                    settings.setValue("PipelineMonitor/lastBaseMapIndex", index)
+                    self.logger.debug(f"已保存当前底图索引: {index}")
+                else:
+                    self.logger.warning(f"找不到底图节点: {selected_layer.name()}")
+            except Exception as e:
+                self.logger.error(f"显示底图时出错: {str(e)}")
+                self.update_status_label("切换底图时出现错误")
+        else:
+            self.logger.warning(f"选择的底图不存在或无效")
+            self.update_status_label(f"底图未找到，请检查网络连接")
+
+        # 确保数据图层在顶部
+        self.ensure_data_layers_on_top()
 
     def activate_point_tool(self):
         try:
@@ -175,13 +446,17 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
                 canvas_crs, layer_crs, QgsProject.instance()
             )
             click_point_in_layer_crs = transform.transform(point)
+            self.logger.debug(
+                f"转换点击坐标从 {canvas_crs.authid()} 到 {layer_crs.authid()}"
+            )
         else:
-            self.logger.debug(f"DEBUG: CRS match (both are: {canvas_crs.authid()}).")
+            self.logger.debug(f"画布和图层使用相同的坐标系: {canvas_crs.authid()}")
 
-        # Define a search tolerance in map units (e.g., 5 map units)
-        tolerance = 5  # Adjust this value as needed
+        # Web Mercator (EPSG:3857)坐标系下的搜索容差需要较大
+        # 因为EPSG:3857的单位是米，而不是度
+        tolerance = 50  # 50米的搜索半径
 
-        # Create a search rectangle around the clicked point
+        # 创建一个搜索矩形
         search_rect = QgsRectangle(
             click_point_in_layer_crs.x() - tolerance,
             click_point_in_layer_crs.y() - tolerance,
@@ -189,14 +464,14 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
             click_point_in_layer_crs.y() + tolerance,
         )
 
-        # Create a feature request with the search rectangle
+        # 创建一个要素请求
         request = QgsFeatureRequest().setFilterRect(search_rect)
         found_features = list(self.piles_layer.getFeatures(request))
 
         if found_features:
             self.logger.debug(f"Found {len(found_features)} feature(s) nearby.")
 
-            # Find the closest feature to the click point
+            # 找到最接近点击位置的要素
             closest_feature = None
             min_distance = float("inf")
 
@@ -238,7 +513,13 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
             self.iface.mapCanvas().unsetMapTool(self.point_tool)
         super(PipelineMonitorDialog, self).closeEvent(event)
 
-    def load_and_display_data(self):
+    def load_and_display_data(self, auto_zoom=False):
+        """
+        加载并显示数据
+
+        参数:
+            auto_zoom (bool): 是否自动缩放到图层范围，默认为False
+        """
         self.update_status_label("正在连接数据库并加载数据...")
         conn = db_operations.create_connection()
         if not (conn and conn.is_connected()):
@@ -254,149 +535,262 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
                 if conn.is_connected():
                     conn.close()
                 return
-            self.create_or_update_piles_layer(all_piles, latest_voltages)
-            self.create_or_update_pipeline_layer(all_piles)
+
+            # 检查图层是否已经存在
+            existing_piles_layer = self.find_existing_layer("测试桩图层 (带风险状态)")
+            existing_pipeline_layer = self.find_existing_layer("管线图层")
+
+            # 记录是否需要创建新图层
+            new_layers_created = False
+
+            # 如果不存在测试桩图层或其引用已失效，则创建新图层
+            if not existing_piles_layer:
+                self.logger.debug("测试桩图层不存在或已失效，创建新图层")
+                self.create_or_update_piles_layer(all_piles, latest_voltages)
+                new_layers_created = True
+            else:
+                self.logger.debug("测试桩图层已存在，使用现有图层")
+                self.piles_layer = existing_piles_layer
+
+            # 如果不存在管线图层或其引用已失效，则创建新图层
+            if not existing_pipeline_layer:
+                self.logger.debug("管线图层不存在或已失效，创建新图层")
+                self.create_or_update_pipeline_layer(all_piles)
+                new_layers_created = True
+            else:
+                self.logger.debug("管线图层已存在，使用现有图层")
+                self.pipeline_layer = existing_pipeline_layer
+
+            # 更新测试桩列表
             self.populate_pile_list(all_piles)
-            self.zoom_to_layers()
+
+            # 确保数据图层在顶部
+            self.ensure_data_layers_on_top()
+
+            # 只有在需要时才缩放到图层
+            if auto_zoom:
+                self.logger.debug("自动缩放到图层范围")
+                self.zoom_to_layers()
+            else:
+                self.logger.debug("跳过自动缩放，保留当前视图")
+
+            # 标记数据已加载
+            self.data_loaded = True
+
+            # 更新状态
             self.update_status_label(f"加载成功！共加载 {len(all_piles)} 个测试桩。")
         except Exception as e:
-            error_details = traceback.format_exc()
             self.update_status_label(
                 f"发生错误: {type(e).__name__}。详情见Python控制台。"
             )
             self.logger.exception("插件执行时发生严重错误！")
-            print(error_details)
         finally:
             if conn and conn.is_connected():
                 conn.close()
-        self._log_layer_tree_structure(
-            "After initial data load and layer creation"
-        )  # Log after initial load
-
-        # Debugging: Check layer validity before calling ensure_main_layers_on_top
-        piles_valid = self.piles_layer and self.piles_layer.isValid()
-        pipeline_valid = self.pipeline_layer and self.pipeline_layer.isValid()
-        self.logger.debug(
-            f"Before ensure_main_layers_on_top: piles_layer valid = {piles_valid}, pipeline_layer valid = {pipeline_valid}"
-        )
-
-        self.ensure_main_layers_on_top()
 
     def create_or_update_piles_layer(self, piles_data, latest_voltages):
         """根据最新电压数据创建或更新测试桩的点图层，并应用分类渲染"""
         layer_name = "测试桩图层 (带风险状态)"
         self.remove_layer_by_name(layer_name)
 
-        vl = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
-        pr = vl.dataProvider()
+        try:
+            # 创建新图层，使用Web Mercator (EPSG:3857)投影
+            vl = QgsVectorLayer("Point?crs=EPSG:3857", layer_name, "memory")
+            pr = vl.dataProvider()
 
-        # Connect destroyed signal to clean up reference
-        vl.destroyed.connect(self._on_layer_destroyed)
+            # 检查图层和数据提供者是否有效
+            if not vl.isValid() or not pr.isValid():
+                self.logger.error(
+                    f"创建测试桩图层失败: 图层有效性={vl.isValid()}, 提供者有效性={pr.isValid()}"
+                )
+                self.update_status_label("创建测试桩图层时出错")
+                return
 
-        self.logger.debug(f"Piles layer initial validity: {vl.isValid()}")
-        self.logger.debug(f"Data provider initial validity: {pr.isValid()}")
-        self.logger.debug(f"Data provider capabilities: {pr.capabilities()}")
+            # Connect destroyed signal to clean up reference
+            try:
+                vl.destroyed.connect(self._on_layer_destroyed)
+                self.logger.debug("成功连接测试桩图层销毁信号")
+            except Exception as e:
+                self.logger.warning(f"连接测试桩图层销毁信号失败: {str(e)}")
 
-        # Add fields
-        pr.addAttributes(
-            [
-                QgsField("id", QVariant.Int),
-                QgsField("name", QVariant.String),
-                QgsField("voltage", QVariant.Double),
-                QgsField("risk_level", QVariant.String),
-            ]
-        )
-        vl.updateFields()
+            self.logger.debug(f"Piles layer initial validity: {vl.isValid()}")
+            self.logger.debug(f"Data provider initial validity: {pr.isValid()}")
+            self.logger.debug(f"Data provider capabilities: {pr.capabilities()}")
 
-        # Create features
-        features_to_add = []
-        for pile in piles_data:
-            pile_id = pile["id"]
-            current_voltage_info = latest_voltages.get(pile_id)
-            self.logger.debug(
-                f"DEBUG: pile_id: {pile_id}, current_voltage_info type: {type(current_voltage_info)}, value: {current_voltage_info}"
+            # 添加字段
+            try:
+                # 使用推荐的QgsField构造方式
+                pr.addAttributes(
+                    [
+                        QgsField("id", QMetaType.Int, "Integer"),
+                        QgsField("name", QMetaType.QString, "String", 50),
+                        QgsField("voltage", QMetaType.Double, "Double", 10, 3),
+                        QgsField("risk_level", QMetaType.QString, "String", 20),
+                    ]
+                )
+                vl.updateFields()
+            except Exception as e:
+                self.logger.error(f"添加测试桩图层字段时出错: {str(e)}")
+
+            # 创建坐标转换器，从WGS84转换到Web Mercator
+            source_crs = QgsCoordinateReferenceSystem("EPSG:4326")  # WGS84
+            dest_crs = QgsCoordinateReferenceSystem("EPSG:3857")  # Web Mercator
+            transform = QgsCoordinateTransform(
+                source_crs, dest_crs, QgsProject.instance()
             )
 
-            current_voltage = (
-                float(current_voltage_info["voltage"])
-                if current_voltage_info
-                and current_voltage_info.get("voltage") is not None
-                else 9999.0  # Use 9999.0 for unknown/missing latest voltage
-            )
-            self.logger.debug(
-                f"DEBUG: current_voltage type: {type(current_voltage)}, value: {current_voltage}"
-            )
-            risk_level = self.calculate_risk_level(current_voltage)
+            # Create features
+            features_to_add = []
+            for pile in piles_data:
+                try:
+                    pile_id = pile["id"]
+                    current_voltage_info = latest_voltages.get(pile_id)
+                    self.logger.debug(
+                        f"DEBUG: pile_id: {pile_id}, current_voltage_info type: {type(current_voltage_info)}, value: {current_voltage_info}"
+                    )
 
-            feat = QgsFeature()
-            point = QgsPointXY(pile["longitude"], pile["latitude"])
-            feat.setGeometry(QgsGeometry.fromPointXY(point))
-            feat.setAttributes([pile["id"], pile["name"], current_voltage, risk_level])
-            features_to_add.append(feat)
+                    current_voltage = (
+                        float(current_voltage_info["voltage"])
+                        if current_voltage_info
+                        and current_voltage_info.get("voltage") is not None
+                        else 9999.0  # Use 9999.0 for unknown/missing latest voltage
+                    )
+                    self.logger.debug(
+                        f"DEBUG: current_voltage type: {type(current_voltage)}, value: {current_voltage}"
+                    )
+                    risk_level = self.calculate_risk_level(current_voltage)
 
-        self.logger.debug(f"Number of features to add: {len(features_to_add)}")
+                    feat = QgsFeature()
+                    # 将WGS84坐标转换为Web Mercator
+                    point = QgsPointXY(pile["longitude"], pile["latitude"])
+                    transformed_point = transform.transform(point)
+                    feat.setGeometry(QgsGeometry.fromPointXY(transformed_point))
+                    feat.setAttributes(
+                        [pile["id"], pile["name"], current_voltage, risk_level]
+                    )
+                    features_to_add.append(feat)
+                except Exception as e:
+                    self.logger.error(
+                        f"处理测试桩 ID {pile.get('id', 'unknown')} 时出错: {str(e)}"
+                    )
 
-        if features_to_add:
-            # Add features and commit changes
-            success = pr.addFeatures(features_to_add)
-            self.logger.debug(f"Features added successfully: {success}")
+            self.logger.debug(f"Number of features to add: {len(features_to_add)}")
 
-            # Force update of layer
-            vl.updateExtents()
-            self.logger.debug(f"Layer feature count after update: {vl.featureCount()}")
+            if features_to_add:
+                try:
+                    # Add features and commit changes
+                    success = pr.addFeatures(features_to_add)
+                    self.logger.debug(f"Features added successfully: {success}")
 
-        # Apply categorized renderer
-        target_field = "risk_level"
-        symbol_rules = [
-            {"category": "过保护", "label": "过保护", "color": "#0000FF"},
-            {"category": "正常", "label": "正常", "color": "#00FF00"},
-            {"category": "欠保护", "label": "欠保护", "color": "#FF0000"},
-            {"category": "未知", "label": "未知/无数据", "color": "#808080"},
-        ]
+                    # Force update of layer
+                    vl.updateExtents()
+                    self.logger.debug(
+                        f"Layer feature count after update: {vl.featureCount()}"
+                    )
+                except Exception as e:
+                    self.logger.error(f"添加测试桩要素时出错: {str(e)}")
 
-        categories = []
-        for rule in symbol_rules:
-            symbol = QgsMarkerSymbol.createSimple(
-                {"name": "circle", "size": "4", "color": rule["color"]}
-            )
-            category = QgsRendererCategory(rule["category"], symbol, rule["label"])
-            categories.append(category)
+            # 应用分类渲染器
+            try:
+                target_field = "risk_level"
+                symbol_rules = [
+                    {"category": "过保护", "label": "过保护", "color": "#0000FF"},
+                    {"category": "正常", "label": "正常", "color": "#00FF00"},
+                    {"category": "欠保护", "label": "欠保护", "color": "#FF0000"},
+                    {"category": "未知", "label": "未知/无数据", "color": "#808080"},
+                ]
 
-        renderer = QgsCategorizedSymbolRenderer(target_field, categories)
-        vl.setRenderer(renderer)
-        vl.triggerRepaint()
+                categories = []
+                for rule in symbol_rules:
+                    symbol = QgsMarkerSymbol.createSimple(
+                        {"name": "circle", "size": "4", "color": rule["color"]}
+                    )
+                    category = QgsRendererCategory(
+                        rule["category"], symbol, rule["label"]
+                    )
+                    categories.append(category)
 
-        # Add layer to project
-        QgsProject.instance().addMapLayer(vl)
-        self.piles_layer = vl
+                renderer = QgsCategorizedSymbolRenderer(target_field, categories)
+                vl.setRenderer(renderer)
+                vl.triggerRepaint()
+            except Exception as e:
+                self.logger.error(f"设置测试桩渲染器时出错: {str(e)}")
 
-        # Ensure layer is on top
-        self.ensure_main_layers_on_top()
+            # 添加图层到项目
+            try:
+                QgsProject.instance().addMapLayer(vl)
+                self.piles_layer = vl
+                self.logger.debug(f"测试桩图层已添加到项目, ID: {vl.id()}")
+            except Exception as e:
+                self.logger.error(f"将测试桩图层添加到项目时出错: {str(e)}")
+                return
+        except Exception as e:
+            self.logger.error(f"创建测试桩图层时发生未知错误: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            self.update_status_label("创建测试桩图层时出错")
 
     def create_or_update_pipeline_layer(self, piles_data):
         """创建或更新管线的线图层"""
         layer_name = "管线图层"
         self.remove_layer_by_name(layer_name)
 
-        vl = QgsVectorLayer("LineString?crs=EPSG:4326", layer_name, "memory")
-        pr = vl.dataProvider()
+        try:
+            # 创建新图层，使用Web Mercator (EPSG:3857)投影
+            vl = QgsVectorLayer("LineString?crs=EPSG:3857", layer_name, "memory")
+            pr = vl.dataProvider()
 
-        # Connect destroyed signal to clean up reference
-        vl.destroyed.connect(self._on_layer_destroyed)
+            # 检查图层和数据提供者是否有效
+            if not vl.isValid() or not pr.isValid():
+                self.logger.error(
+                    f"创建管线图层失败: 图层有效性={vl.isValid()}, 提供者有效性={pr.isValid()}"
+                )
+                self.update_status_label("创建管线图层时出错")
+                return
 
-        points = [QgsPointXY(p["longitude"], p["latitude"]) for p in piles_data]
-        if len(points) > 1:
-            feat = QgsFeature()
-            line = QgsLineString(points)
-            feat.setGeometry(QgsGeometry.fromWkt(line.asWkt()))
-            pr.addFeature(feat)
+            # Connect destroyed signal to clean up reference
+            try:
+                vl.destroyed.connect(self._on_layer_destroyed)
+                self.logger.debug("成功连接管线图层销毁信号")
+            except Exception as e:
+                self.logger.warning(f"连接管线图层销毁信号失败: {str(e)}")
 
-        # Add layer to project
-        QgsProject.instance().addMapLayer(vl)
-        self.pipeline_layer = vl
+            # 创建坐标转换器，从WGS84转换到Web Mercator
+            source_crs = QgsCoordinateReferenceSystem("EPSG:4326")  # WGS84
+            dest_crs = QgsCoordinateReferenceSystem("EPSG:3857")  # Web Mercator
+            transform = QgsCoordinateTransform(
+                source_crs, dest_crs, QgsProject.instance()
+            )
 
-        # Ensure layer is on top
-        self.ensure_main_layers_on_top()
+            # 添加管线数据
+            points = []
+            for p in piles_data:
+                # 转换每个点的坐标
+                point = QgsPointXY(p["longitude"], p["latitude"])
+                transformed_point = transform.transform(point)
+                points.append(transformed_point)
+
+            if len(points) > 1:
+                try:
+                    feat = QgsFeature()
+                    line = QgsLineString(points)
+                    feat.setGeometry(QgsGeometry.fromWkt(line.asWkt()))
+                    pr.addFeature(feat)
+                    self.logger.debug("成功添加管线要素")
+                except Exception as e:
+                    self.logger.error(f"添加管线要素时出错: {str(e)}")
+
+            # Add layer to project
+            try:
+                QgsProject.instance().addMapLayer(vl)
+                self.pipeline_layer = vl
+                self.logger.debug(f"管线图层已添加到项目, ID: {vl.id()}")
+            except Exception as e:
+                self.logger.error(f"将管线图层添加到项目时出错: {str(e)}")
+                return
+        except Exception as e:
+            self.logger.error(f"创建管线图层时发生未知错误: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            self.update_status_label("创建管线图层时出错")
 
     def remove_layer_by_name(self, layer_name):
         # Get all layers currently in project as a list for safe iteration
@@ -407,6 +801,7 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
         if layers_to_remove:
             self.logger.debug(f"Removing layer by name: {layer_name}")
             removed_layer = layers_to_remove[0]
+            layer_id = removed_layer.id()  # 在移除前保存ID
 
             # Disconnect the destroyed signal for this specific layer
             # This prevents _on_layer_destroyed from being called for this layer's removal
@@ -430,58 +825,89 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
                     f"Cleared self.pipeline_layer reference for {layer_name}."
                 )
 
-            QgsProject.instance().removeMapLayer(removed_layer.id())
-            self.logger.debug(
-                f"Successfully removed layer with ID: {removed_layer.id()}"
-            )
+            if self.current_base_map is removed_layer:
+                self.current_base_map = None
+                self.logger.debug(
+                    f"Cleared self.current_base_map reference for {layer_name}."
+                )
+
+            # 移除图层
+            QgsProject.instance().removeMapLayer(layer_id)
+            self.logger.debug(f"Successfully removed layer with ID: {layer_id}")
         else:
             self.logger.debug(f"Layer '{layer_name}' not found for explicit removal.")
 
-    def ensure_main_layers_on_top(self):
-        """确保主图层（测试桩和管线）显示在最上层"""
+    def ensure_data_layers_on_top(self):
+        """确保数据图层（测试桩和管线）显示在最上层，底图保持在底层"""
         if not self.iface:
             return
 
+        # 获取图层树根节点
         root = QgsProject.instance().layerTreeRoot()
 
-        # Get the layers we want to move to top
-        layers_to_move = []
-        if self.piles_layer and self.piles_layer.isValid():
-            layers_to_move.append(self.piles_layer)
-        if self.pipeline_layer and self.pipeline_layer.isValid():
-            layers_to_move.append(self.pipeline_layer)
+        # 查找测试桩和管线图层
+        data_layers = []
+        for layer_name in ["测试桩图层 (带风险状态)", "管线图层"]:
+            layers = QgsProject.instance().mapLayersByName(layer_name)
+            if layers:
+                data_layers.append(layers[0])
 
-        # Move layers to top
-        for layer in layers_to_move:
-            node = root.findLayer(layer.id())
-            if node:
-                clone = node.clone()
-                parent = node.parent()
-                parent.insertChildNode(-1, clone)
-                parent.removeChildNode(node)
+                # 更新内部引用
+                if layer_name == "测试桩图层 (带风险状态)" and (
+                    self.piles_layer is None or not self.piles_layer.isValid()
+                ):
+                    self.piles_layer = layers[0]
+                elif layer_name == "管线图层" and (
+                    self.pipeline_layer is None or not self.pipeline_layer.isValid()
+                ):
+                    self.pipeline_layer = layers[0]
 
-        self.iface.mapCanvas().refresh()
+        if not data_layers:
+            return
 
-    def _log_layer_tree_structure(self, context="Current Layer Tree"):
-        """Logs the current structure of the QGIS layer tree."""
-        self.logger.debug(f"--- {context} --- ")
-        root = QgsProject.instance().layerTreeRoot()
-        self._log_node(root, 0)
-        self.logger.debug(f"--- End of {context} ---")
+        # 按顺序处理数据图层，确保它们按期望的顺序放在顶部
+        # 先处理管线图层，后处理测试桩图层，这样测试桩会在最顶部
+        for layer_name in ["管线图层", "测试桩图层 (带风险状态)"]:
+            for layer in data_layers:
+                if layer.name() == layer_name:
+                    try:
+                        # 获取图层节点
+                        node_layer = root.findLayer(layer.id())
+                        if node_layer:
+                            # 获取父节点
+                            parent = node_layer.parent()
+                            if parent:
+                                # 克隆节点
+                                cloned_node = node_layer.clone()
+                                # 在根节点索引0处插入克隆的节点(索引0是顶部)
+                                root.insertChildNode(0, cloned_node)
+                                # 删除原始节点
+                                parent.removeChildNode(node_layer)
+                    except Exception as e:
+                        self.logger.error(
+                            f"移动图层 {layer.name()} 到顶部时出错: {str(e)}"
+                        )
 
-    def _log_node(self, node, level):
-        indent = "  " * level
-        if node.nodeType() == QgsLayerTree.NodeLayer:
-            layer = node.layer()
-            if layer:
-                self.logger.debug(f"{indent}Layer: {layer.name()} (ID: {layer.id()})")
-            else:
-                self.logger.debug(f"{indent}Layer (Invalid): {node.name()}")
-        elif node.nodeType() == QgsLayerTree.NodeGroup:
-            self.logger.debug(f"{indent}Group: {node.name()}")
+        # 刷新画布以应用更改
+        try:
+            self.iface.mapCanvas().refresh()
+        except Exception as e:
+            self.logger.error(f"刷新画布时出错: {str(e)}")
 
-        for child in node.children():
-            self._log_node(child, level + 1)
+    def _on_layer_destroyed(self, destroyed_qobject):
+        """处理图层被销毁的情况，清理内部引用"""
+        # 清理内部引用
+        if self.piles_layer is destroyed_qobject:
+            self.piles_layer = None
+            self.logger.debug("测试桩图层引用已清理")
+
+        if self.pipeline_layer is destroyed_qobject:
+            self.pipeline_layer = None
+            self.logger.debug("管线图层引用已清理")
+
+        if self.current_base_map is destroyed_qobject:
+            self.current_base_map = None
+            self.logger.debug("当前底图引用已清理")
 
     def populate_pile_list(self, piles_data):
         if hasattr(self, "pileListWidget"):
@@ -494,29 +920,103 @@ class PipelineMonitorDialog(QDialog, FORM_CLASS):
         if hasattr(self, "statusLabel"):
             self.statusLabel.setText(message)
 
-    def zoom_to_layers(self):
-        if self.piles_layer and self.iface:
-            canvas = self.iface.mapCanvas()
-            full_extent = self.piles_layer.extent()
-            if self.pipeline_layer:
-                full_extent.combineExtentWith(self.pipeline_layer.extent())
+    def zoom_to_layers(self, preserve_scale=False):
+        """
+        缩放到测试桩和管线图层的范围
 
-            full_extent.grow(0.1)
-            canvas.setExtent(full_extent)
-            canvas.refresh()
+        参数:
+            preserve_scale (bool): 如果为True，则保持当前比例尺不变，只移动到图层中心
+        """
+        if not self.iface:
+            return
 
-    def _on_layer_destroyed(self, destroyed_qobject):
-        self.logger.debug(
-            f"A QObject was destroyed. Checking if it's a layer we manage. Destroyed QObject (type: {type(destroyed_qobject).__name__})."
+        # 查找有效的测试桩图层
+        valid_piles_layer = (
+            self.piles_layer
+            if self.piles_layer and self.piles_layer.isValid()
+            else None
+        )
+        valid_pipeline_layer = (
+            self.pipeline_layer
+            if self.pipeline_layer and self.pipeline_layer.isValid()
+            else None
         )
 
-        # Clear our internal references if the destroyed object is one of our managed layers
-        if self.piles_layer is destroyed_qobject:
-            self.piles_layer = None
-            self.logger.debug("Cleared self.piles_layer reference as it was destroyed.")
+        # 如果现有对象无效，尝试通过名称查找
+        if not valid_piles_layer:
+            layers = QgsProject.instance().mapLayersByName("测试桩图层 (带风险状态)")
+            if layers:
+                valid_piles_layer = layers[0]
+                self.piles_layer = layers[0]  # 更新引用
 
-        if self.pipeline_layer is destroyed_qobject:
-            self.pipeline_layer = None
-            self.logger.debug(
-                "Cleared self.pipeline_layer reference as it was destroyed."
-            )
+        if not valid_pipeline_layer:
+            layers = QgsProject.instance().mapLayersByName("管线图层")
+            if layers:
+                valid_pipeline_layer = layers[0]
+                self.pipeline_layer = layers[0]  # 更新引用
+
+        # 如果有有效的测试桩图层，则缩放到范围
+        if valid_piles_layer:
+            canvas = self.iface.mapCanvas()
+            full_extent = valid_piles_layer.extent()
+
+            # 如果有管线图层，则合并范围
+            if valid_pipeline_layer:
+                full_extent.combineExtentWith(valid_pipeline_layer.extent())
+
+            # 扩大范围，留出边距
+            full_extent.grow(0.1)
+
+            if preserve_scale:
+                # 只移动到图层中心，保持当前比例尺
+                center = full_extent.center()
+                current_extent = canvas.extent()
+                width = current_extent.width()
+                height = current_extent.height()
+                new_extent = QgsRectangle(
+                    center.x() - width / 2,
+                    center.y() - height / 2,
+                    center.x() + width / 2,
+                    center.y() + height / 2,
+                )
+                canvas.setExtent(new_extent)
+                self.logger.debug("移动到图层中心，保持当前比例尺")
+            else:
+                # 设置画布范围并刷新
+                canvas.setExtent(full_extent)
+                self.logger.debug("缩放到图层完整范围")
+
+            canvas.refresh()
+            self.logger.debug("成功更新视图")
+
+    def find_existing_layer(self, layer_name):
+        """
+        查找项目中指定名称的图层，如找到则返回图层对象，否则返回None
+        """
+        layers = QgsProject.instance().mapLayersByName(layer_name)
+        if layers and len(layers) > 0:
+            layer = layers[0]
+            if layer.isValid():
+                return layer
+        return None
+
+    def showEvent(self, event):
+        """当对话框显示时调用，确保不会重置视图"""
+        super(PipelineMonitorDialog, self).showEvent(event)
+
+        # 如果不是首次打开，则不进行任何视图重置操作
+        if not self.first_open:
+            self.logger.debug("对话框再次打开，保留当前视图")
+        else:
+            # 首次打开时初始化底图
+            if self.iface:
+                self.logger.debug("对话框首次打开，初始化底图")
+                self.initialize_base_maps()
+
+                # 如果数据尚未加载，则加载数据
+                if not self.data_loaded:
+                    self.logger.debug("首次打开，加载数据并保持当前比例尺")
+                    self.load_and_display_data(auto_zoom=False)
+                    # 移动到图层中心但保持当前比例尺
+                    self.zoom_to_layers(preserve_scale=True)
+                    self.data_loaded = True
